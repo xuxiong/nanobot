@@ -1,16 +1,17 @@
-"""Tests for /restart slash command."""
+"""Tests for slash commands handled in AgentLoop."""
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from nanobot.bus.events import InboundMessage
+from nanobot.config.schema import CLIRunnerConfig
 
 
-def _make_loop():
+def _make_loop(cli_runners=None):
     """Create a minimal AgentLoop with mocked dependencies."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
@@ -24,7 +25,7 @@ def _make_loop():
     with patch("nanobot.agent.loop.ContextBuilder"), \
          patch("nanobot.agent.loop.SessionManager"), \
          patch("nanobot.agent.loop.SubagentManager"):
-        loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
+        loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, cli_runners=cli_runners)
     return loop, bus
 
 
@@ -74,3 +75,97 @@ class TestRestartCommand:
 
         assert response is not None
         assert "/restart" in response.content
+        assert "/codex <prompt>" in response.content
+        assert "/gemini <prompt>" in response.content
+        assert "/qwen <prompt>" in response.content
+        assert "/codefree <prompt>" in response.content
+
+
+class TestCodexCommand:
+
+    @pytest.mark.asyncio
+    async def test_codex_command_runs_local_exec(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/codex fix the failing test")
+
+        with patch.object(loop, "_run_cli_runner", new=AsyncMock(return_value="fixed")) as mock_run:
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "fixed"
+        mock_run.assert_awaited_once_with("codex", "fix the failing test")
+
+    @pytest.mark.asyncio
+    async def test_plain_codex_prefix_runs_local_exec(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="codex summarize this repo")
+
+        with patch.object(loop, "_run_cli_runner", new=AsyncMock(return_value="summary")) as mock_run:
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "summary"
+        mock_run.assert_awaited_once_with("codex", "summarize this repo")
+
+    @pytest.mark.asyncio
+    async def test_codex_command_requires_prompt(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/codex")
+
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "Usage: /codex <prompt>"
+
+
+class TestCliRunners:
+
+    @pytest.mark.asyncio
+    async def test_builtin_qwen_runner_dispatches(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/qwen explain this repo")
+
+        with patch.object(loop, "_run_cli_runner", new=AsyncMock(return_value="qwen-summary")) as mock_run:
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "qwen-summary"
+        mock_run.assert_awaited_once_with("qwen", "explain this repo")
+
+    @pytest.mark.asyncio
+    async def test_custom_cli_runner_dispatches(self):
+        loop, _ = _make_loop(
+            cli_runners={
+                "demo": CLIRunnerConfig(
+                    command="demo-cli",
+                    args=["--prompt", "{prompt}"],
+                    description="Run demo CLI",
+                )
+            }
+        )
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/demo say hello")
+
+        with patch.object(loop, "_run_cli_runner", new=AsyncMock(return_value="demo-output")) as mock_run:
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "demo-output"
+        mock_run.assert_awaited_once_with("demo", "say hello")
+
+    @pytest.mark.asyncio
+    async def test_custom_cli_runner_help_entry(self):
+        loop, _ = _make_loop(
+            cli_runners={
+                "demo": CLIRunnerConfig(
+                    command="demo-cli",
+                    args=["--prompt", "{prompt}"],
+                    description="Run demo CLI",
+                )
+            }
+        )
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/help")
+
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "/demo <prompt> — Run demo CLI" in response.content

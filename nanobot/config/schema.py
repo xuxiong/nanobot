@@ -332,6 +332,18 @@ class ExecToolConfig(Base):
     path_append: str = ""
 
 
+class CLIRunnerConfig(Base):
+    """External CLI runner configuration."""
+
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    description: str = ""
+    stdin_prompt: bool = False
+    capture: Literal["stdout", "stderr", "output_file"] = "stdout"
+    timeout: int = 1800
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -349,6 +361,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    cli_runners: dict[str, CLIRunnerConfig] = Field(default_factory=dict)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 

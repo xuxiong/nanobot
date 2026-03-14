@@ -127,7 +127,14 @@
 ```bash
 git clone https://github.com/HKUDS/nanobot.git
 cd nanobot
-pip install -e .
+uv sync --extra dev
+```
+
+Run the local source tree instead of a globally installed `nanobot`:
+
+```bash
+uv run python -m nanobot --version
+uv run python -m nanobot agent -m "Hello!"
 ```
 
 **Install with [uv](https://github.com/astral-sh/uv)** (stable, fast)
@@ -825,6 +832,95 @@ nanobot agent -c ~/.nanobot-telegram/config.json -w /tmp/nanobot-telegram-test -
 </details>
 
 <details>
+<summary><b>Local CLI Runners (`/codex`, `/gemini`, `/qwen`, `/codefree`)</b></summary>
+
+Use a local coding CLI directly from chat by sending `/codex ...`, `/gemini ...`, `/qwen ...`, or `/codefree ...`.
+
+This is different from the `openai_codex` provider above:
+
+- `openai_codex` provider: nanobot uses Codex as its main LLM provider
+- local CLI runner: nanobot shells out to a locally installed CLI and returns that CLI's result
+
+Built-in runners:
+
+- `/codex <prompt>` -> `codex -a never exec ...`
+- `/gemini <prompt>` -> `gemini -p ...`
+- `/qwen <prompt>` -> `qwen --approval-mode yolo --channel CI --output-format text ...`
+- `/codefree <prompt>` -> `codefree --approval-mode yolo --channel CI --output-format text ...`
+
+Examples:
+
+```bash
+nanobot agent -m "/codex fix the failing test and summarize the changes"
+nanobot agent -m "/gemini explain the architecture of this repo"
+nanobot agent -m "/qwen review the last commit for regressions"
+nanobot agent -m "/codefree clean up this module and explain the tradeoffs"
+```
+
+If you are developing in this repository and already have a global `nanobot` installed, run the local source tree explicitly:
+
+```bash
+cd /path/to/nanobot
+uv sync --extra dev
+uv run python -m nanobot agent -m "/codex fix the failing test and summarize the changes"
+```
+
+Notes:
+
+- these commands require the corresponding local CLI to be installed and authenticated
+- the reply is the final result captured from that CLI; it is not streamed token-by-token today
+- `nanobot agent --logs ...` shows nanobot runtime logs, not the full live TUI output of the child CLI
+
+You can add more runners in `~/.nanobot/config.json` under `tools.cliRunners`:
+
+```json
+{
+  "tools": {
+    "cliRunners": {
+      "demo": {
+        "command": "demo-cli",
+        "args": ["--cwd", "{workspace}", "--prompt", "{prompt}"],
+        "description": "Run demo CLI",
+        "capture": "stdout",
+        "timeout": 1800
+      }
+    }
+  }
+}
+```
+
+Then run it with:
+
+```bash
+nanobot agent -m "/demo inspect this project"
+```
+
+Supported placeholders in `args` and `cwd`:
+
+- `{prompt}`: the user text after `/runner`
+- `{workspace}`: the active nanobot workspace path
+- `{output}`: a temporary output file path created by nanobot for CLIs that write their final answer to a file
+
+Example using `{output}`:
+
+```json
+{
+  "tools": {
+    "cliRunners": {
+      "writer": {
+        "command": "some-cli",
+        "args": ["--out", "{output}", "{prompt}"],
+        "capture": "output_file",
+        "description": "Capture final answer from a file"
+      }
+    }
+  }
+}
+```
+
+</details>
+
+<details>
 <summary><b>Custom Provider (Any OpenAI-compatible API)</b></summary>
 
 Connects directly to any OpenAI-compatible endpoint — LM Studio, llama.cpp, Together AI, Fireworks, Azure OpenAI, or any self-hosted server. Bypasses LiteLLM; model name is passed as-is.
@@ -1233,6 +1329,7 @@ nanobot gateway --config ~/.nanobot-telegram/config.json --workspace /tmp/nanobo
 |---------|-------------|
 | `nanobot onboard` | Initialize config & workspace |
 | `nanobot agent -m "..."` | Chat with the agent |
+| `nanobot agent -m "/codex ..."` | Run a local coding CLI non-interactively |
 | `nanobot agent -w <workspace>` | Chat against a specific workspace |
 | `nanobot agent -w <workspace> -c <config>` | Chat against a specific workspace/config |
 | `nanobot agent` | Interactive chat mode |

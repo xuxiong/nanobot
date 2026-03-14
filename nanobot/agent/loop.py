@@ -6,7 +6,9 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -29,7 +31,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebSearchConfig
+    from nanobot.config.schema import CLIRunnerConfig, ChannelsConfig, ExecToolConfig, WebSearchConfig
     from nanobot.cron.service import CronService
 
 
@@ -58,6 +60,7 @@ class AgentLoop:
         web_search_config: WebSearchConfig | None = None,
         web_proxy: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        cli_runners: dict[str, "CLIRunnerConfig"] | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -76,6 +79,7 @@ class AgentLoop:
         self.web_search_config = web_search_config or WebSearchConfig()
         self.web_proxy = web_proxy
         self.exec_config = exec_config or ExecToolConfig()
+        self.cli_runners = {name.lower(): runner for name, runner in (cli_runners or {}).items()}
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
@@ -299,6 +303,177 @@ class AgentLoop:
 
         asyncio.create_task(_do_restart())
 
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        """Remove ANSI escape sequences from CLI output."""
+        return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+
+    @staticmethod
+    def _extract_cli_runner_request(
+        content: str, names: list[str],
+    ) -> tuple[str, str] | None:
+        """Return (runner_name, prompt) for matching `/name ...` or `name ...` input."""
+        stripped = content.strip()
+        for name in sorted((n.lower() for n in names), key=len, reverse=True):
+            for prefix in (f"/{name}", name):
+                if stripped == prefix:
+                    return name, ""
+                if stripped.startswith(prefix) and len(stripped) > len(prefix) and stripped[len(prefix)].isspace():
+                    return name, stripped[len(prefix):].strip()
+        return None
+
+    @staticmethod
+    def _runner_value(runner: Any, key: str, default: Any = None) -> Any:
+        if isinstance(runner, dict):
+            return runner.get(key, default)
+        return getattr(runner, key, default)
+
+    def _builtin_cli_runners(self) -> dict[str, dict[str, Any]]:
+        """Built-in external CLI integrations."""
+        workspace = str(self.workspace)
+        return {
+            "codex": {
+                "command": "codex",
+                "args": [
+                    "-a",
+                    "never",
+                    "exec",
+                    "--sandbox",
+                    "workspace-write",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    "--output-last-message",
+                    "{output}",
+                    "-C",
+                    workspace,
+                    "{prompt}",
+                ],
+                "description": "Run local Codex CLI in non-interactive mode",
+                "capture": "output_file",
+                "timeout": 1800,
+            },
+            "gemini": {
+                "command": "gemini",
+                "args": ["-p", "{prompt}"],
+                "description": "Run local Gemini CLI in non-interactive mode",
+                "capture": "stdout",
+                "timeout": 1800,
+            },
+            "qwen": {
+                "command": "qwen",
+                "args": ["--approval-mode", "yolo", "--channel", "CI", "--output-format", "text", "{prompt}"],
+                "description": "Run local Qwen Code CLI in non-interactive mode",
+                "capture": "stdout",
+                "timeout": 1800,
+            },
+            "codefree": {
+                "command": "codefree",
+                "args": ["--approval-mode", "yolo", "--channel", "CI", "--output-format", "text", "{prompt}"],
+                "description": "Run local CodeFree CLI in non-interactive mode",
+                "capture": "stdout",
+                "timeout": 1800,
+            },
+        }
+
+    def _available_cli_runners(self) -> dict[str, Any]:
+        """Return built-in and configured CLI runners, with config overriding built-ins."""
+        runners = self._builtin_cli_runners()
+        runners.update(self.cli_runners)
+        return runners
+
+    def _render_cli_arg(self, value: str, prompt: str, output_path: str | None) -> str:
+        rendered = value.replace("{workspace}", str(self.workspace)).replace("{prompt}", prompt)
+        if output_path:
+            rendered = rendered.replace("{output}", output_path)
+        return rendered
+
+    async def _run_cli_runner(self, name: str, prompt: str) -> str:
+        """Run a configured local CLI in non-interactive mode and return the final text."""
+        runner = self._available_cli_runners().get(name.lower())
+        if runner is None:
+            return f"Error: CLI runner `{name}` is not configured."
+
+        command = self._runner_value(runner, "command", "")
+        if not command:
+            return f"Error: CLI runner `{name}` has no command configured."
+
+        cli_bin = shutil.which(command)
+        if not cli_bin:
+            return f"Error: `{command}` CLI not found in PATH."
+
+        output_path: str | None = None
+        try:
+            args = list(self._runner_value(runner, "args", []))
+            if any("{output}" in arg for arg in args):
+                with tempfile.NamedTemporaryFile(prefix=f"nanobot-{name}-", suffix=".txt", delete=False) as tmp:
+                    output_path = tmp.name
+
+            rendered_args = [self._render_cli_arg(arg, prompt, output_path) for arg in args]
+            cwd_value = self._runner_value(runner, "cwd")
+            cwd = self._render_cli_arg(cwd_value, prompt, output_path) if cwd_value else str(self.workspace)
+            stdin_prompt = bool(self._runner_value(runner, "stdin_prompt", False))
+            timeout = int(self._runner_value(runner, "timeout", 1800))
+
+            process = await asyncio.create_subprocess_exec(
+                cli_bin,
+                *rendered_args,
+                stdin=asyncio.subprocess.PIPE if stdin_prompt else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+            )
+
+            stdin_data = prompt.encode("utf-8") if stdin_prompt else None
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(stdin_data), timeout=timeout)
+            except asyncio.TimeoutError:
+                process.kill()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                return f"{name} failed: command timed out after {timeout} seconds"
+
+            stdout_text = self._strip_ansi(stdout.decode("utf-8", errors="replace")).strip()
+            stderr_text = self._strip_ansi(stderr.decode("utf-8", errors="replace")).strip()
+            file_text = ""
+            if output_path and Path(output_path).exists():
+                file_text = Path(output_path).read_text(encoding="utf-8").strip()
+
+            capture = self._runner_value(runner, "capture", "stdout")
+            final_text = {
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "output_file": file_text,
+            }.get(capture, stdout_text)
+            final_text = final_text or file_text or stdout_text or stderr_text
+
+            if process.returncode == 0:
+                return final_text or f"{name} finished without returning any text."
+
+            details = stderr_text or stdout_text or file_text or "unknown error"
+            return f"{name} failed (exit {process.returncode}):\n{details}"
+        except Exception as e:
+            return f"Error running `{name}` CLI: {e}"
+        finally:
+            if output_path:
+                try:
+                    Path(output_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    async def _handle_cli_runner(self, msg: InboundMessage, name: str, prompt: str) -> OutboundMessage:
+        """Execute a direct external CLI prompt without routing through the LLM provider."""
+        if not prompt:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=f"Usage: /{name} <prompt>",
+            )
+        result = await self._run_cli_runner(name, prompt)
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
+
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
         async with self._processing_lock:
@@ -366,6 +541,10 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
+        cli_request = self._extract_cli_runner_request(msg.content, list(self._available_cli_runners()))
+        if cli_request is not None:
+            runner_name, prompt = cli_request
+            return await self._handle_cli_runner(msg, runner_name, prompt)
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
 
@@ -400,6 +579,9 @@ class AgentLoop:
                 "/restart — Restart the bot",
                 "/help — Show available commands",
             ]
+            for name, runner in self._available_cli_runners().items():
+                description = self._runner_value(runner, "description", "") or f"Run local {name} CLI"
+                lines.insert(-1, f"/{name} <prompt> — {description}")
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
             )
