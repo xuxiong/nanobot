@@ -382,6 +382,53 @@ class AgentLoop:
         runners.update(self.cli_runners)
         return runners
 
+    def _runner_as_dict(self, runner: Any) -> dict[str, Any]:
+        """Normalize runner config to a plain dict with all supported fields."""
+        return {
+            "command": self._runner_value(runner, "command", ""),
+            "args": list(self._runner_value(runner, "args", [])),
+            "cwd": self._runner_value(runner, "cwd"),
+            "description": self._runner_value(runner, "description", ""),
+            "stdin_prompt": bool(self._runner_value(runner, "stdin_prompt", False)),
+            "capture": self._runner_value(runner, "capture", "stdout"),
+            "timeout": int(self._runner_value(runner, "timeout", 1800)),
+        }
+
+    def _set_runner_cwd(self, runner_name: str, cwd: str | None) -> str:
+        """Set runner cwd at runtime and persist it into config."""
+        from nanobot.config.loader import load_config, save_config
+        from nanobot.config.schema import CLIRunnerConfig
+
+        name = runner_name.strip().lower()
+        if not name:
+            return "Usage: /runner-cwd <runner> <cwd|default>"
+
+        available = self._available_cli_runners()
+        runner = available.get(name)
+        if runner is None:
+            known = ", ".join(sorted(available))
+            return f"Unknown CLI runner `{name}`. Available: {known}"
+
+        # Persist the full runner config so built-ins keep all fields when overridden.
+        normalized = self._runner_as_dict(runner)
+        normalized["cwd"] = cwd
+        self.cli_runners[name] = normalized
+
+        try:
+            config = load_config()
+            config.tools.cli_runners[name] = CLIRunnerConfig.model_validate(normalized)
+            save_config(config)
+        except Exception as e:
+            logger.exception("Failed to persist runner cwd for {}", name)
+            effective = cwd or "{workspace}"
+            return (
+                f"Updated `{name}` cwd to `{effective}` for current runtime, "
+                f"but failed to persist config: {e}"
+            )
+
+        effective = cwd or "{workspace}"
+        return f"Updated `{name}` cwd to `{effective}`. Effective immediately."
+
     def _render_cli_arg(self, value: str, prompt: str, output_path: str | None) -> str:
         rendered = value.replace("{workspace}", str(self.workspace)).replace("{prompt}", prompt)
         if output_path:
@@ -549,7 +596,8 @@ class AgentLoop:
         session = self.sessions.get_or_create(key)
 
         # Slash commands
-        cmd = msg.content.strip().lower()
+        raw = msg.content.strip()
+        cmd = raw.lower()
         if cmd == "/new":
             try:
                 if not await self.memory_consolidator.archive_unconsolidated(session):
@@ -577,6 +625,7 @@ class AgentLoop:
                 "/new — Start a new conversation",
                 "/stop — Stop the current task",
                 "/restart — Restart the bot",
+                "/runner-cwd <runner> <cwd|default> — Set CLI runner cwd now",
                 "/help — Show available commands",
             ]
             for name, runner in self._available_cli_runners().items():
@@ -585,6 +634,19 @@ class AgentLoop:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines),
             )
+        if cmd.startswith("/runner-cwd"):
+            parts = raw.split(maxsplit=2)
+            if len(parts) < 3:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Usage: /runner-cwd <runner> <cwd|default>",
+                )
+            runner_name = parts[1]
+            cwd_arg = parts[2].strip()
+            cwd = None if cwd_arg.lower() in {"default", "workspace", "-"} else cwd_arg
+            result = self._set_runner_cwd(runner_name, cwd)
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))

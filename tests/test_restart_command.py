@@ -169,3 +169,60 @@ class TestCliRunners:
 
         assert response is not None
         assert "/demo <prompt> — Run demo CLI" in response.content
+
+
+class TestRunnerCwdCommand:
+
+    @pytest.mark.asyncio
+    async def test_runner_cwd_requires_args(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/runner-cwd")
+
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "Usage: /runner-cwd <runner> <cwd|default>"
+
+    @pytest.mark.asyncio
+    async def test_runner_cwd_updates_builtin_and_persists(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/runner-cwd codex /tmp/codex-ws")
+
+        loaded = MagicMock()
+        loaded.tools.cli_runners = {}
+
+        with patch("nanobot.config.loader.load_config", return_value=loaded), \
+             patch("nanobot.config.loader.save_config") as mock_save:
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "Updated `codex` cwd to `/tmp/codex-ws`. Effective immediately."
+        assert loop._runner_value(loop._available_cli_runners()["codex"], "cwd") == "/tmp/codex-ws"
+        assert loaded.tools.cli_runners["codex"].cwd == "/tmp/codex-ws"
+        mock_save.assert_called_once_with(loaded)
+
+    @pytest.mark.asyncio
+    async def test_runner_cwd_default_falls_back_to_workspace(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/runner-cwd codex default")
+
+        loaded = MagicMock()
+        loaded.tools.cli_runners = {}
+
+        with patch("nanobot.config.loader.load_config", return_value=loaded), \
+             patch("nanobot.config.loader.save_config"):
+            response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content == "Updated `codex` cwd to `{workspace}`. Effective immediately."
+        assert loaded.tools.cli_runners["codex"].cwd is None
+
+    @pytest.mark.asyncio
+    async def test_runner_cwd_rejects_unknown_runner(self):
+        loop, _ = _make_loop()
+        msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/runner-cwd no-such /tmp/x")
+
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content.startswith("Unknown CLI runner `no-such`.")
